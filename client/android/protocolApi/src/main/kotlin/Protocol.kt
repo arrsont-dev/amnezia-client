@@ -26,12 +26,19 @@ abstract class Protocol {
     protected lateinit var context: Context
     protected lateinit var state: MutableStateFlow<ProtocolState>
     protected lateinit var onError: (String) -> Unit
+    protected lateinit var onTunnelStale: () -> Unit
     protected var isInitialized: Boolean = false
 
-    fun initialize(context: Context, state: MutableStateFlow<ProtocolState>, onError: (String) -> Unit) {
+    fun initialize(
+        context: Context,
+        state: MutableStateFlow<ProtocolState>,
+        onError: (String) -> Unit,
+        onTunnelStale: () -> Unit = {}
+    ) {
         this.context = context
         this.state = state
         this.onError = onError
+        this.onTunnelStale = onTunnelStale
         internalInit()
         isInitialized = true
     }

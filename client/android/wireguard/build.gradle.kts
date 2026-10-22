@@ -15,4 +15,6 @@ dependencies {
     compileOnly(project(":utils"))
     compileOnly(project(":protocolApi"))
     implementation(libs.kotlinx.coroutines)
+
+    testImplementation(libs.junit)
 }

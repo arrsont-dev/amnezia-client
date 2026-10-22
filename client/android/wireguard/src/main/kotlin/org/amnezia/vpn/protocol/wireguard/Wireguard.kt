@@ -1,6 +1,8 @@
 package org.amnezia.vpn.protocol.wireguard
 
 import android.net.VpnService.Builder
+import android.os.PowerManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -22,8 +24,61 @@ import org.amnezia.vpn.util.net.InetNetwork
 import org.amnezia.vpn.util.net.parseInetAddress
 import org.amnezia.vpn.util.optStringOrNull
 import org.json.JSONObject
+import kotlin.math.max
 
 private const val TAG = "Wireguard"
+private const val WATCHDOG_CHECK_INTERVAL_MS = 30_000L
+private const val WAKE_LOCK_TAG = "amnezia:wireguard-tunnel"
+
+// WireGuard core defaults, used when the tunnel does not report its own timings.
+private const val DEFAULT_REJECT_AFTER_TIME_SEC = 180L
+private const val DEFAULT_KEEPALIVE_TIMEOUT_SEC = 10L
+private const val DEFAULT_REKEY_TIMEOUT_SEC = 5L
+private const val DEFAULT_REKEY_AFTER_TIME_SEC = 120L
+
+private val GO_DURATION = Regex("""(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)""")
+
+/**
+ * Parses a Go duration string ("3m0s", "5s", "1h30m0s") into seconds.
+ */
+internal fun parseGoDurationSeconds(value: String?): Long? {
+    if (value.isNullOrBlank()) return null
+    var seconds = 0.0
+    var found = false
+    for (match in GO_DURATION.findAll(value)) {
+        val amount = match.groupValues[1].toDouble()
+        seconds += when (match.groupValues[2]) {
+            "ns" -> amount / 1_000_000_000
+            "us", "µs" -> amount / 1_000_000
+            "ms" -> amount / 1_000
+            "s" -> amount
+            "m" -> amount * 60
+            "h" -> amount * 3600
+            else -> 0.0
+        }
+        found = true
+    }
+    return if (found) seconds.toLong() else null
+}
+
+/**
+ * The peer session is stale when the core stops expecting a fresh handshake.
+ *
+ * Mirrors keyRefreshTimeoutReceiving() of the amneziawg-go core and never drops below the rekey
+ * interval, so a healthy tunnel, which rekeys on its own, is not recreated.
+ */
+internal fun staleTunnelThresholdSec(
+    rejectAfterTimeSec: Long?,
+    keepaliveTimeoutSec: Long?,
+    rekeyTimeoutSec: Long?,
+    rekeyAfterTimeSec: Long?
+): Long {
+    val rejectAfterTime = rejectAfterTimeSec ?: DEFAULT_REJECT_AFTER_TIME_SEC
+    val keepaliveTimeout = keepaliveTimeoutSec ?: DEFAULT_KEEPALIVE_TIMEOUT_SEC
+    val rekeyTimeout = rekeyTimeoutSec ?: DEFAULT_REKEY_TIMEOUT_SEC
+    val rekeyAfterTime = rekeyAfterTimeSec ?: DEFAULT_REKEY_AFTER_TIME_SEC
+    return max(max(0L, rejectAfterTime - keepaliveTimeout - rekeyTimeout), rekeyAfterTime + keepaliveTimeout)
+}
 
 open class Wireguard : Protocol() {
 
@@ -32,6 +87,8 @@ open class Wireguard : Protocol() {
     protected open val ifName: String = "amn0"
     private lateinit var scope: CoroutineScope
     private var statusJob: Job? = null
+    private var watchdogJob: Job? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override val statistics: Statistics
         get() {
@@ -189,6 +246,8 @@ open class Wireguard : Protocol() {
             throw VpnStartException("Protect VPN interface: permission not granted or revoked")
         }
         launchStatusJob()
+        acquireWakeLock()
+        launchWatchdog()
     }
 
     private fun launchStatusJob() {
@@ -227,7 +286,85 @@ open class Wireguard : Protocol() {
         return lastHandshake
     }
 
+    /**
+     * Recreates the tunnel when the peer session went stale.
+     *
+     * While the device is asleep the core timers do not run, so no keepalive is sent and the peer
+     * session expires. Once the device wakes up, the core retries the handshake and clears the
+     * cached source address on every attempt, but the mobile operator may have moved the tunnel to
+     * a different NAT port, in which case the handshake never reaches the server and the core
+     * gives up ("Handshake did not complete after N attempts, giving up"). The peer is then left
+     * without a keypair and drops every packet, so the tunnel stays dead until it is recreated.
+     * Recreating it opens a new socket, which restores the session.
+     */
+    private fun launchWatchdog() {
+        stopWatchdog()
+        watchdogJob = scope.launch {
+            while (true) {
+                delay(WATCHDOG_CHECK_INTERVAL_MS)
+                try {
+                    recreateStaleTunnel()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.e(TAG, "Tunnel watchdog failed: ${e.message}")
+                }
+            }
+        }
+    }
+
+    private fun stopWatchdog() {
+        watchdogJob?.cancel()
+        watchdogJob = null
+    }
+
+    private fun recreateStaleTunnel() {
+        if (!isTunnelStale()) return
+        Log.w(TAG, "Tunnel handshake is stale, recreating the tunnel")
+        onTunnelStale()
+    }
+
+    private fun isTunnelStale(): Boolean {
+        val handshake = getLastHandshake()
+        if (handshake <= 0) return false
+        val ageSec = System.currentTimeMillis() / 1000 - handshake
+        return ageSec > currentStaleThresholdSec()
+    }
+
+    private fun currentStaleThresholdSec(): Long {
+        val config = if (tunnelHandle == -1) null else GoBackend.awgGetConfig(tunnelHandle)
+        return staleTunnelThresholdSec(
+            parseGoDurationSeconds(configValue(config, "reject_after_time")),
+            parseGoDurationSeconds(configValue(config, "keepalive_timeout")),
+            parseGoDurationSeconds(configValue(config, "rekey_timeout")),
+            parseGoDurationSeconds(configValue(config, "rekey_after_time"))
+        )
+    }
+
+    private fun configValue(config: String?, key: String): String? =
+        config?.lines()?.firstOrNull { it.startsWith("$key=") }?.substringAfter('=')
+
+    /**
+     * Keeps the CPU awake while the tunnel is up, so the core timers keep sending keepalives and
+     * can re-handshake on their own after the device wakes up.
+     */
+    private fun acquireWakeLock() {
+        if (wakeLock != null) return
+        val powerManager = context.getSystemService(PowerManager::class.java) ?: return
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG).apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let { lock -> if (lock.isHeld) lock.release() }
+        wakeLock = null
+    }
+
     private fun turnOffVpn() {
+        stopWatchdog()
+        releaseWakeLock()
         statusJob?.cancel()
         statusJob = null
         val handleToClose = tunnelHandle

@@ -13,6 +13,7 @@ androidx-datastore = "1.1.1"
 kotlinx-coroutines = "1.8.1"
 kotlinx-serialization = "1.6.3"
 google-mlkit = "17.3.0"
+junit = "4.13.2"
 
 [libraries]
 android-billing = { module = "com.android.billingclient:billing-ktx", version.ref = "android-billing" }
@@ -30,6 +31,7 @@ androidx-datastore = { module = "androidx.datastore:datastore-preferences", vers
 kotlinx-coroutines = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "kotlinx-coroutines" }
 kotlinx-serialization-protobuf = { module = "org.jetbrains.kotlinx:kotlinx-serialization-protobuf", version.ref = "kotlinx-serialization" }
 google-mlkit = { module = "com.google.mlkit:barcode-scanning", version.ref = "google-mlkit" }
+junit = { module = "junit:junit", version.ref = "junit" }
 
 [bundles]
 androidx-camera = [
